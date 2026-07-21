@@ -102,23 +102,131 @@ Powertech. Tech Lead / Principal Engineer
 
 ## Сложности
 
-- Транзакции, join, логирование между сервисами
-- Ошибки проектирования дорогие
-- Разные подходы и свой набор паттернов
-- **Сеть** ≠ 0 latency, нестабильна
+На пальцах:
 
----
+- **Нет общего JOIN** — данные в разных сервисах
+- **Нет одной транзакции** на «user + payment» → согласованность «чуть позже» (eventual consistency)
+- **Логи разъехались** — без correlation id больно искать
+- **Сеть врёт** — таймауты, «ушло, ответа нет» → повтор запроса (retry)
+- **Неверный разрез границ** потом чинится месяцами
+
+--
 
 ## Паттерны
 
 - Domain-Driven Design (DDD)
-- Service registry / discovery
-- API Gateway
-- Retry requests
-- Event sourcing
-- Request Correlation ID
+- Service registry / discovery — «справочник» адресов сервисов
+- API Gateway — единая входная дверь
+- Retry — повтор при сбое
+- Event sourcing — история событий
+- Request Correlation ID — сквозной id запроса
 
----
+--
+
+## API Gateway
+
+Клиент не знает про Users / Mailer / Hash.
+
+```text
+Клиент ─HTTP─► Gateway ─Redis─► Users
+                  └─gRPC─► Hash
+```
+
+- одна точка входа (auth, CORS, URL)
+- скрывает внутренности
+- место для correlation id и retry
+
+Демо: `apps/api-gateway` `:3000`
+
+--
+
+## Service discovery
+
+Сервисы переезжают между хостами. Как найти адрес?
+
+**Идея:** registry («справочник») — сервис регистрируется, клиенты спрашивают «где users?»
+
+Прод: Consul, K8s DNS, service mesh (сетевой слой между сервисами).
+
+**В демо упрощено:** Redis как точка встречи; Hash — `127.0.0.1:50051`.
+
+--
+
+## Retry requests
+
+Соседний сервис «моргнул» ≠ бизнес-ошибка.  
+Повторяем N раз с паузой (backoff). Повтор не должен дважды слать письмо (идемпотентность).
+
+```typescript
+return withRetry(
+  () => lastValueFrom(this.users.send({ cmd: 'users.create' }, dto)),
+  { label: 'users.create' },
+);
+```
+
+`libs/common/src/retry.ts` + вызовы в gateway.
+
+--
+
+## Event sourcing (lite)
+
+Храним не только «как сейчас», а **что случилось**:
+
+`UserCreated` → `EmailChanged` → …
+
+```typescript
+this.users.save(user);
+this.events.append({ type: 'UserCreated', aggregateId, payload, ... });
+```
+
+```bash
+GET /users/:id/events
+```
+
+В демо — упрощение: и снимок состояния (snapshot), и лента событий  
+(идея без полного «собрать заново из истории»).
+
+--
+
+## DDD — bounded context
+
+Одно слово — разные модели в разных частях системы.
+
+«Пользователь» при регистрации: email + имя.  
+«Пользователь» при оплате: тариф и способ оплаты.  
+Смешивать в одну сущность `User` на всё — плохо: лишние поля и связность.
+
+**Ограниченный контекст** — граница, внутри которой у терминов и модели одно значение. Часто = один микросервис.
+
+**В демо:**
+
+| Контекст | Где код | Своя модель |
+| --- | --- | --- |
+| Users | `apps/users` | user + `UserCreated` |
+| Mailer | `apps/mailer` | письмо (to, subject, body) |
+| Hash | `apps/hash` | GenerateHash |
+
+Users не знает про SMTP. Mailer не хранит User. Связь — сообщение с полями, не общая модель.
+
+--
+
+## DDD — единый язык и слои
+
+**Единый язык:** внутри контекста те же термины в коде  
+(`UserCreated`, не `pay()` для регистрации).
+
+Слои в `apps/users`:
+
+```text
+domain/events.ts
+infrastructure/…      ← хранение
+users.service.ts      ← сценарий
+users.controller.ts   ← вход Redis
+```
+
+Gateway — входная точка, не отдельный доменный контекст.
+
+--
 
 ## Request Correlation ID
 
@@ -166,16 +274,6 @@ curl -i -X POST http://127.0.0.1:3000/users \
 
 ---
 
-## Паттерн DDD
-
-- Проектируем вокруг **доменной модели**
-- Система = набор **контекстов**, у каждого своя модель
-- Слои: репозиторий, сервис, агрегат и т.д.
-
-В демо: `apps/users` — domain / infrastructure / service
-
----
-
 ## Взаимодействие сервисов
 
 - Брокеры сообщений: RabbitMQ, Kafka, NATS, Redis
@@ -191,7 +289,7 @@ curl -i -X POST http://127.0.0.1:3000/users \
 
 ### Redis Pub/Sub
 
-- Модель: Pub/Sub (часто fire-and-forget)
+- Модель: Pub/Sub — «опубликовал → кто слушал, тот получил» (часто fire-and-forget: отправил и не ждёшь ответа)
 - По умолчанию **не хранит** сообщение
 - Просто для демо и NestJS-примеров
 
@@ -199,24 +297,24 @@ curl -i -X POST http://127.0.0.1:3000/users \
 
 ### Apache Kafka
 
-- Модель: лог событий (commit log)
+- Модель: лог событий / commit log — тетрадь только на дописывание
 - **Хранит** долго, можно перечитать
-- Высокий throughput, много consumers
+- Высокий throughput (пропускная способность), много читателей
 
 --
 
 ### RabbitMQ
 
-- Очереди + маршрутизация
-- Хранит до ack / TTL
-- Классические очереди задач, routing
+- Очереди + маршрутизация (routing)
+- Хранит до ack («обработал») / TTL
+- Классические очереди задач
 
 --
 
 ### NATS
 
 - Лёгкий messaging
-- JetStream — опциональное хранение
+- JetStream — опциональное хранение на стороне NATS
 - Низкая задержка, cloud-native
 
 ---
@@ -369,9 +467,19 @@ Nest `Transport.REDIS` = запрос–ответ / pub-sub между серв
 
 ## gRPC
 
-- HTTP/2.0
-- Protocol Buffers — бинарные данные
-- Контракт в `.proto`
+- HTTP/2 + Protocol Buffers (бинарный контракт)
+- Синхронный RPC «как вызов метода»
+- Контракт в `.proto` договаривают сервисы заранее
+
+Зачем не только JSON/HTTP: строже контракт, часто быстрее на внутренних вызовах.
+
+--
+
+## gRPC в демо
+
+```text
+POST /hash → Gateway → gRPC GenerateHash → apps/hash
+```
 
 ```protobuf
 service TaskService {
@@ -380,7 +488,12 @@ service TaskService {
 }
 ```
 
-В демо: `POST /hash` → Gateway → gRPC Hash-сервис
+```bash
+curl -X POST http://127.0.0.1:3000/hash \
+  -d '{"id":1,"data":"hello-otus"}'
+```
+
+Не в цепочке регистрации — отдельный сценарий.
 
 ---
 
